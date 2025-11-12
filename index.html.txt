@@ -1,0 +1,143 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Object→Arduino (class1/class2)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; padding:20px; }
+    video { width:640px; height:480px; background:#000; display:block; }
+    button { padding:8px 12px; margin:8px; }
+    #status { margin-top:8px; font-weight:600; }
+    .led { display:inline-block; width:18px; height:18px; border-radius:50%; background:#444; margin-right:8px; vertical-align:middle; }
+    .on { box-shadow:0 0 8px #0f0; background:#0f0; }
+  </style>
+</head>
+<body>
+  <h1>Object Detection → Arduino</h1>
+  <video id="webcam" autoplay muted playsinline></video>
+  <div>
+    <button id="btnStart">Start Camera & Model</button>
+    <button id="btnConnect">Connect Arduino</button>
+    <span id="status">Status: idle</span>
+  </div>
+  <div style="margin-top:12px;">
+    <span class="led" id="led1"></span> class1
+    <span style="margin-left:24px;"></span>
+    <span class="led" id="led2"></span> class2
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.16.0/dist/tf.min.js"></script>
+  <script>
+    const MODEL_PATH = 'model/model.json'; // model folder must be at web root
+    const TOP_CONFIDENCE = 0.65;  // default you chose
+    const FRAME_INTERVAL_MS = 150;
+
+    const video = document.getElementById('webcam');
+    const btnStart = document.getElementById('btnStart');
+    const btnConnect = document.getElementById('btnConnect');
+    const statusEl = document.getElementById('status');
+    const led1 = document.getElementById('led1');
+    const led2 = document.getElementById('led2');
+
+    let port = null;
+    let writer = null;
+    let model = null;
+    let labels = null;
+    let lastSent = null;
+
+    btnStart.onclick = async () => { await startCameraAndModel(); };
+    btnConnect.onclick = async () => { await connectSerial(); };
+
+    async function startCameraAndModel() {
+      try {
+        status('Starting camera...');
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        video.srcObject = stream;
+        await video.play();
+
+        status('Loading model...');
+        model = await tf.loadLayersModel(MODEL_PATH);
+        // try to load metadata.json labels if present
+        try {
+          const meta = await (await fetch('model/metadata.json')).json();
+          labels = meta.labels || null;
+        } catch(e) { labels = null; }
+        status('Model loaded. Ready.');
+        runLoop();
+      } catch (e) {
+        console.error(e);
+        status('Error: ' + e.message);
+      }
+    }
+
+    function status(txt) { statusEl.textContent = 'Status: ' + txt; }
+
+    async function connectSerial() {
+      if (!('serial' in navigator)) {
+        alert('Web Serial API not supported. Use Chrome or Edge.');
+        return;
+      }
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 9600 });
+        writer = port.writable.getWriter();
+        status('Arduino connected');
+      } catch (e) {
+        console.error(e);
+        status('Serial connect failed');
+      }
+    }
+
+    async function sendCmd(cmd) {
+      if (!writer) return;
+      const data = new TextEncoder().encode(cmd + '\n');
+      try { await writer.write(data); } catch(e){ console.error('Write failed', e); }
+    }
+
+    async function runLoop() {
+      if (!model) return;
+      const tcanvas = document.createElement('canvas');
+      tcanvas.width = 224; tcanvas.height = 224;
+      const ctx = tcanvas.getContext('2d');
+
+      while (true) {
+        ctx.drawImage(video, 0, 0, 224, 224);
+        let imgData = ctx.getImageData(0,0,224,224);
+        let img = tf.browser.fromPixels(imgData).toFloat();
+        let norm = img.div(127.5).sub(1.0);
+        let bat = norm.expandDims(0);
+
+        let preds = await model.predict(bat).data();
+        let predsArr = Array.from(preds);
+        let topIdx = predsArr.indexOf(Math.max(...predsArr));
+        let topConf = predsArr[topIdx];
+
+        let cmd = 'NONE';
+        if (topConf >= TOP_CONFIDENCE) {
+          if (topIdx === 0) cmd = 'C1';
+          else if (topIdx === 1) cmd = 'C2';
+          else cmd = 'NONE';
+        } else cmd = 'NONE';
+
+        led1.classList.toggle('on', cmd === 'C1');
+        led2.classList.toggle('on', cmd === 'C2');
+        let labelName = labels ? labels[topIdx] : ('class' + (topIdx+1));
+        status(`${labelName} ${(topConf*100).toFixed(1)}% -> ${cmd}`);
+
+        if (cmd !== lastSent) {
+          sendCmd(cmd);
+          lastSent = cmd;
+        }
+
+        bat.dispose(); img.dispose(); norm.dispose();
+        await new Promise(r => setTimeout(r, FRAME_INTERVAL_MS));
+      }
+    }
+
+    window.addEventListener('beforeunload', async () => {
+      try { if (writer) await writer.close(); if (port) await port.close(); } catch {}
+    });
+  </script>
+</body>
+</html>
